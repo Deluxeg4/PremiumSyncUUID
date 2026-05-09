@@ -1,0 +1,7 @@
+name: PremiumSyncUUID
+version: '${version}'
+main: com.example.premiumsyncuuid.PremiumSyncUUID
+api-version: '1.20'
+folia-supported: true
+author: CADS
+
