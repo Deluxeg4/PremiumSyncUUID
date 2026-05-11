@@ -24,7 +24,7 @@ public class UUIDSyncListener implements Listener {
     private final File mapFile;
     private final File nameFile;
     private final File migratedFolder;
-    private final boolean isFoliaOrPaper;
+    private final boolean isModernScheduler;
 
     private final Map<UUID, UUID> onlineToOfflineMap = new ConcurrentHashMap<>();
     private final Map<UUID, String> onlineToNameMap = new ConcurrentHashMap<>();
@@ -32,19 +32,20 @@ public class UUIDSyncListener implements Listener {
     public UUIDSyncListener(JavaPlugin plugin) {
         this.plugin = plugin;
         this.dataFolder = plugin.getDataFolder();
-        this.dataFolder.mkdirs();
+        if (!this.dataFolder.exists()) {
+            this.dataFolder.mkdirs();
+        }
         this.mapFile = new File(dataFolder, "uuid_map.properties");
         this.nameFile = new File(dataFolder, "uuid_name.properties");
         this.migratedFolder = new File(dataFolder, "migrated");
-        this.migratedFolder.mkdirs();
-        this.isFoliaOrPaper = detectFoliaOrPaper();
+        if (!this.migratedFolder.exists()) {
+            this.migratedFolder.mkdirs();
+        }
+        this.isModernScheduler = detectModernScheduler();
         loadMaps();
     }
 
-    // ========================
-    // Auto-detect Paper/Folia
-    // ========================
-    private boolean detectFoliaOrPaper() {
+    private boolean detectModernScheduler() {
         try {
             Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
             return true; // Folia
@@ -57,7 +58,7 @@ public class UUIDSyncListener implements Listener {
     }
 
     private void runAsync(Runnable task) {
-        if (isFoliaOrPaper) {
+        if (isModernScheduler) {
             plugin.getServer().getAsyncScheduler().runNow(plugin, t -> task.run());
         } else {
             Bukkit.getScheduler().runTaskAsynchronously(plugin, task);
@@ -65,7 +66,7 @@ public class UUIDSyncListener implements Listener {
     }
 
     private void runAsyncDelayed(Runnable task, long delayMs) {
-        if (isFoliaOrPaper) {
+        if (isModernScheduler) {
             plugin.getServer().getAsyncScheduler().runDelayed(plugin, t -> task.run(), delayMs, TimeUnit.MILLISECONDS);
         } else {
             long ticks = Math.max(1, delayMs / 50);
@@ -73,63 +74,42 @@ public class UUIDSyncListener implements Listener {
         }
     }
 
-    // ========================
-    // Load/Save maps
-    // ========================
     private void loadMaps() {
-        if (mapFile.exists()) {
-            Properties props = new Properties();
-            try (FileInputStream fis = new FileInputStream(mapFile)) {
-                props.load(fis);
-                for (String key : props.stringPropertyNames()) {
-                    onlineToOfflineMap.put(UUID.fromString(key), UUID.fromString(props.getProperty(key)));
-                }
-            } catch (IOException e) {
-                plugin.getLogger().severe("[UUIDSync] Failed to load uuid_map: " + e.getMessage());
-            }
-        }
+        loadMap(mapFile, (k, v) -> onlineToOfflineMap.put(UUID.fromString(k), UUID.fromString(v)));
+        loadMap(nameFile, (k, v) -> onlineToNameMap.put(UUID.fromString(k), v));
+    }
 
-        if (nameFile.exists()) {
+    private void loadMap(File file, java.util.function.BiConsumer<String, String> consumer) {
+        if (file.exists()) {
             Properties props = new Properties();
-            try (FileInputStream fis = new FileInputStream(nameFile)) {
+            try (FileInputStream fis = new FileInputStream(file)) {
                 props.load(fis);
-                for (String key : props.stringPropertyNames()) {
-                    onlineToNameMap.put(UUID.fromString(key), props.getProperty(key));
-                }
-            } catch (IOException e) {
-                plugin.getLogger().severe("[UUIDSync] Failed to load uuid_name: " + e.getMessage());
+                props.forEach((k, v) -> consumer.accept((String) k, (String) v));
+            } catch (IOException | IllegalArgumentException e) {
+                plugin.getLogger().severe("[UUIDSync] Failed to load " + file.getName() + ": " + e.getMessage());
             }
         }
     }
 
-    private void saveMaps() {
-        Properties mapProps = new Properties();
-        onlineToOfflineMap.forEach((k, v) -> mapProps.setProperty(k.toString(), v.toString()));
-        try (FileOutputStream fos = new FileOutputStream(mapFile)) {
-            mapProps.store(fos, "UUIDSync online->offline map");
-        } catch (IOException e) {
-            plugin.getLogger().severe("[UUIDSync] Failed to save uuid_map: " + e.getMessage());
-        }
+    public void saveMaps() {
+        saveMap(mapFile, onlineToOfflineMap, "UUIDSync online->offline map");
+        saveMap(nameFile, onlineToNameMap, "UUIDSync online->name map");
+    }
 
-        Properties nameProps = new Properties();
-        onlineToNameMap.forEach((k, v) -> nameProps.setProperty(k.toString(), v));
-        try (FileOutputStream fos = new FileOutputStream(nameFile)) {
-            nameProps.store(fos, "UUIDSync online->name map");
+    private <K, V> void saveMap(File file, Map<K, V> map, String comments) {
+        Properties props = new Properties();
+        map.forEach((k, v) -> props.setProperty(k.toString(), v.toString()));
+        try (FileOutputStream fos = new FileOutputStream(file)) {
+            props.store(fos, comments);
         } catch (IOException e) {
-            plugin.getLogger().severe("[UUIDSync] Failed to save uuid_name: " + e.getMessage());
+            plugin.getLogger().severe("[UUIDSync] Failed to save " + file.getName() + ": " + e.getMessage());
         }
     }
 
-    // ========================
-    // Helper
-    // ========================
     private UUID getOfflineUUID(String name) {
         return UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes(StandardCharsets.UTF_8));
     }
 
-    // ========================
-    // LOGIN: Offline -> Online
-    // ========================
     @EventHandler(priority = EventPriority.LOWEST)
     public void onPreLogin(AsyncPlayerPreLoginEvent event) {
         UUID onlineUUID = event.getUniqueId();
@@ -145,7 +125,7 @@ public class UUIDSyncListener implements Listener {
 
         if (nameChanged) {
             UUID oldOfflineUUID = getOfflineUUID(oldName);
-            copyData(onlineUUID, offlineUUID);
+            syncPlayerData(onlineUUID, offlineUUID);
             archiveOldData(oldOfflineUUID);
         }
 
@@ -154,111 +134,87 @@ public class UUIDSyncListener implements Listener {
 
         File flagFile = new File(migratedFolder, onlineUUID + ".flag");
         if (!flagFile.exists() && !nameChanged) {
-            boolean success = copyData(offlineUUID, onlineUUID);
-            if (success) {
-                try { flagFile.createNewFile(); } catch (IOException ignored) {}
+            if (syncPlayerData(offlineUUID, onlineUUID)) {
+                try {
+                    flagFile.createNewFile();
+                } catch (IOException e) {
+                    plugin.getLogger().warning("[UUIDSync] Could not create flag file: " + e.getMessage());
+                }
             }
         }
     }
 
-    // ========================
-    // QUIT: Online -> Offline
-    // ========================
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPlayerQuit(PlayerQuitEvent event) {
         UUID onlineUUID = event.getPlayer().getUniqueId();
         UUID offlineUUID = onlineToOfflineMap.get(onlineUUID);
-        if (offlineUUID == null) return;
-
-        runAsyncDelayed(() -> copyData(onlineUUID, offlineUUID), 20L);
+        if (offlineUUID != null) {
+            runAsyncDelayed(() -> syncPlayerData(onlineUUID, offlineUUID), 1000L); // 1 second delay
+        }
     }
 
-    // ========================
-    // WORLD SAVE: sync ทุกคน (กัน crash)
-    // ========================
     @EventHandler(priority = EventPriority.MONITOR)
     public void onWorldSave(WorldSaveEvent event) {
-        if (!event.getWorld().equals(Bukkit.getWorlds().get(0))) return;
+        // Only trigger on the main world to avoid multiple triggers
+        if (Bukkit.getWorlds().isEmpty() || !event.getWorld().equals(Bukkit.getWorlds().get(0))) return;
 
         runAsync(() -> {
             for (org.bukkit.entity.Player player : Bukkit.getOnlinePlayers()) {
                 UUID onlineUUID = player.getUniqueId();
                 UUID offlineUUID = onlineToOfflineMap.get(onlineUUID);
-                if (offlineUUID == null) continue;
-                copyData(onlineUUID, offlineUUID);
+                if (offlineUUID != null) {
+                    syncPlayerData(onlineUUID, offlineUUID);
+                }
             }
             saveMaps();
         });
     }
 
-    // ========================
-    // Copy data (ใช้ได้ทั้ง 2 ทิศทาง)
-    // ========================
-    private boolean copyData(UUID fromUUID, UUID toUUID) {
-        boolean anySuccess = false;
-
+    private boolean syncPlayerData(UUID fromUUID, UUID toUUID) {
+        boolean success = false;
         for (World world : Bukkit.getWorlds()) {
-            File playerDataFolder = new File(world.getWorldFolder(), "playerdata");
-            File oldFile = new File(playerDataFolder, fromUUID + ".dat");
-            File newFile = new File(playerDataFolder, toUUID + ".dat");
-
-            if (oldFile.exists()) {
-                try {
-                    Files.copy(oldFile.toPath(), newFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                    anySuccess = true;
-                } catch (IOException e) {
-                    plugin.getLogger().severe("[UUIDSync] Failed playerdata: " + e.getMessage());
-                }
+            File worldDir = world.getWorldFolder();
+            if (copyFile(new File(worldDir, "playerdata/" + fromUUID + ".dat"), new File(worldDir, "playerdata/" + toUUID + ".dat"))) {
+                success = true;
             }
         }
 
         if (!Bukkit.getWorlds().isEmpty()) {
-            File baseFolder = Bukkit.getWorlds().get(0).getWorldFolder();
-
-            File oldAdv = new File(baseFolder, "advancements/" + fromUUID + ".json");
-            File newAdv = new File(baseFolder, "advancements/" + toUUID + ".json");
-            if (oldAdv.exists()) {
-                try {
-                    Files.copy(oldAdv.toPath(), newAdv.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                } catch (IOException e) {
-                    plugin.getLogger().severe("[UUIDSync] Failed advancements: " + e.getMessage());
-                }
-            }
-
-            File oldStats = new File(baseFolder, "stats/" + fromUUID + ".json");
-            File newStats = new File(baseFolder, "stats/" + toUUID + ".json");
-            if (oldStats.exists()) {
-                try {
-                    Files.copy(oldStats.toPath(), newStats.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                } catch (IOException e) {
-                    plugin.getLogger().severe("[UUIDSync] Failed stats: " + e.getMessage());
-                }
-            }
+            File mainWorldDir = Bukkit.getWorlds().get(0).getWorldFolder();
+            copyFile(new File(mainWorldDir, "advancements/" + fromUUID + ".json"), new File(mainWorldDir, "advancements/" + toUUID + ".json"));
+            copyFile(new File(mainWorldDir, "stats/" + fromUUID + ".json"), new File(mainWorldDir, "stats/" + toUUID + ".json"));
         }
-
-        return anySuccess;
+        return success;
     }
 
-    // ========================
-    // Archive Offline เก่า (กัน dupe)
-    // ========================
-    private void archiveOldData(UUID oldOfflineUUID) {
+    private void archiveOldData(UUID uuid) {
         for (World world : Bukkit.getWorlds()) {
-            File playerDataFolder = new File(world.getWorldFolder(), "playerdata");
-            File oldFile = new File(playerDataFolder, oldOfflineUUID + ".dat");
-            if (oldFile.exists()) {
-                oldFile.renameTo(new File(playerDataFolder, oldOfflineUUID + ".dat.bak"));
-            }
+            renameToBackup(new File(world.getWorldFolder(), "playerdata/" + uuid + ".dat"));
         }
-
         if (!Bukkit.getWorlds().isEmpty()) {
-            File baseFolder = Bukkit.getWorlds().get(0).getWorldFolder();
+            File mainWorldDir = Bukkit.getWorlds().get(0).getWorldFolder();
+            renameToBackup(new File(mainWorldDir, "advancements/" + uuid + ".json"));
+            renameToBackup(new File(mainWorldDir, "stats/" + uuid + ".json"));
+        }
+    }
 
-            File oldAdv = new File(baseFolder, "advancements/" + oldOfflineUUID + ".json");
-            if (oldAdv.exists()) oldAdv.renameTo(new File(baseFolder, "advancements/" + oldOfflineUUID + ".json.bak"));
+    private boolean copyFile(File source, File target) {
+        if (!source.exists()) return false;
+        try {
+            Files.copy(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            return true;
+        } catch (IOException e) {
+            plugin.getLogger().severe("[UUIDSync] Failed to copy " + source.getName() + ": " + e.getMessage());
+            return false;
+        }
+    }
 
-            File oldStats = new File(baseFolder, "stats/" + oldOfflineUUID + ".json");
-            if (oldStats.exists()) oldStats.renameTo(new File(baseFolder, "stats/" + oldOfflineUUID + ".json.bak"));
+    private void renameToBackup(File file) {
+        if (file.exists()) {
+            File backup = new File(file.getPath() + ".bak");
+            if (!file.renameTo(backup)) {
+                plugin.getLogger().warning("[UUIDSync] Failed to backup " + file.getName());
+            }
         }
     }
 }
